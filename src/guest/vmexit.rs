@@ -1,10 +1,10 @@
 use core::arch::{ global_asm, asm };
 
-use crate::constants::layout::{ TRAMPOLINE, TRAP_CONTEXT };
+use crate::constants::layout::{ TRAMPOLINE, TRAP_CONTEXT, GUEST_DTB_ADDR };
 use crate::device_emu::plic::is_plic_access;
 use crate::guest::page_table::GuestPageTable;
-use crate::guest::pmap::{two_stage_translation, decode_inst_at_addr};
-use crate::page_table::PageTable;
+use crate::guest::pmap::{ two_stage_translation, decode_inst };
+use crate::page_table::{PageTable, PageTableSv39};
 use crate::hypervisor::{HOST_VMM, HostVmm};
 use crate::{ VmmError, VmmResult };
 
@@ -13,6 +13,7 @@ use riscv::register::{ stvec, sscratch, scause, sepc, stval, sie, hgatp, vsatp, 
 use riscv::register::scause::{ Trap, Exception, Interrupt };
 
 pub use super::context::TrapContext;
+use super::pmap::fast_two_stage_translation;
 use super::sbi::sbi_vs_handler;
 
 global_asm!(include_str!("trap.S"));
@@ -60,26 +61,21 @@ fn privileged_inst_handler(_ctx: &mut TrapContext) -> VmmResult {
 pub fn guest_page_fault_handler<P: PageTable, G: GuestPageTable>(host_vmm: &mut HostVmm<P, G>, ctx: &mut TrapContext) -> VmmResult {
     let addr = htval::read() << 2;
     if is_plic_access(addr) {
-        let inst = htinst::read();
+        let mut inst = htinst::read();
         if inst == 0 {
             // If htinst does not provide information about the trap,
             // we must read the instruction from guest's memory manually
             let inst_addr = ctx.sepc;
-            let gpm = &host_vmm.guests[host_vmm.guest_id].as_ref().unwrap().gpm;
-            if let Some(host_inst_addr) = two_stage_translation(
+            // let gpm = &host_vmm.guests[host_vmm.guest_id].as_ref().unwrap().gpm;
+            if let Some(host_inst_addr) = fast_two_stage_translation::<PageTableSv39>(
                 host_vmm.guest_id, 
                 inst_addr, 
-                vsatp::read().bits(), 
-                gpm
+                vsatp::read().bits()
             ) {
-                let (len, inst) = decode_inst_at_addr(host_inst_addr);
-                if let Some(inst) = inst {
-                    host_vmm.handle_plic_access(ctx, stval::read(), inst)?;
-                    ctx.sepc += len;         
-                }else{
-                    return Err(VmmError::DecodeInstError)
-                }
+                inst = unsafe{ core::ptr::read(host_inst_addr as *const usize) };
+                
             }else{
+                herror!("inst addr: {:#x}", inst_addr);
                 return Err(VmmError::TranslationError)
             }
         }else if inst == 0x3020 || inst == 0x3000 {
@@ -90,16 +86,20 @@ pub fn guest_page_fault_handler<P: PageTable, G: GuestPageTable>(host_vmm: &mut 
             // If htinst is valid and is not a pseudo instructon make sure
             // the opcode is valid even if it was a compressed instruction,
             // but before save the real instruction size.
-            todo!()
+        }
+        let (len, inst) = decode_inst(inst);
+        if let Some(inst) = inst {
+            // htracking!("inst: {:?}", inst);
+            host_vmm.handle_plic_access(ctx, addr, inst)?;
+            ctx.sepc += len;         
+        }else{
+            return Err(VmmError::DecodeInstError)
         }
         Ok(())
     }else{
-        // panic!("addr: {:#x}, sepc: {:#x}", addr, ctx.sepc);
-        // Err(VmmError::DeviceNotFound)
-        // todo: handle device
-        ctx.sepc += 4;
-        Ok(())
-        // Err(VmmError::DeviceNotFound)
+        herror!("addr: {:#x}, sepc: {:#x}", addr, ctx.sepc);
+        Err(VmmError::DeviceNotFound)
+        // todo: handle other device
     }
 }
 
@@ -125,6 +125,7 @@ pub fn handle_irq<P: PageTable, G: GuestPageTable>(host_vmm: &mut HostVmm<P, G>,
     host_vmm.irq_pending = true;
 } 
 
+/// forward exception by setting `vsepc` & `vscause`
 pub fn forward_exception(ctx: &mut TrapContext) {
     unsafe{
         asm!(
@@ -143,6 +144,7 @@ pub fn handle_internal_vmm_error(err: VmmError) {
 
 
 #[no_mangle]
+#[allow(unreachable_code)]
 pub unsafe fn trap_handler() -> ! {
     set_kernel_trap_entry();
     let ctx = (TRAP_CONTEXT as *mut TrapContext).as_mut().unwrap();
@@ -183,15 +185,25 @@ pub unsafe fn trap_handler() -> ! {
         if let Err(vmm_err) = guest_page_fault_handler(&mut host_vmm, ctx) {
             err = Some(vmm_err);
         }
+        host_vmm.guest_page_falut += 1;
+        if host_vmm.guest_page_falut % 1000 == 0 {
+            htracking!("guest page fault: {}, addr: {:#x}", host_vmm.guest_page_falut, htval::read() << 2);
+        }
     },
     Trap::Interrupt(Interrupt::SupervisorExternal) => {
         handle_irq(&mut host_vmm, ctx);
+        host_vmm.external_irq += 1;
+        // htracking!("external irq: {}", host_vmm.external_irq);
     },
     Trap::Interrupt(Interrupt::SupervisorTimer) => {
         // set guest timer interrupt pending
         hvip::set_vstip();
         // disable timer interrupt
         sie::clear_stimer();
+        host_vmm.timer_irq += 1;
+        // if host_vmm.timer_irq % 1000 == 0 {
+        //     htracking!("timer irq: {}", host_vmm.timer_irq);
+        // }
     },
     _ => forward_exception(ctx),
     }
@@ -203,6 +215,75 @@ pub unsafe fn trap_handler() -> ! {
     switch_to_guest()
 }
 
+
+
+pub unsafe fn hart_entry_1() -> ! {
+    set_user_trap_entry();
+    // get guest context
+    let ctx = (TRAP_CONTEXT as *mut TrapContext).as_mut().unwrap();
+
+    // hgatp: set page table for guest physical address translation
+    if riscv::register::hgatp::read().bits() != ctx.hgatp {
+        let hgatp = riscv::register::hgatp::Hgatp::from_bits(ctx.hgatp);
+        hgatp.write(); 
+        core::arch::riscv64::hfence_gvma_all();
+        assert_eq!(hgatp.bits(), riscv::register::hgatp::read().bits());
+    }
+    hart_entry_2()
+}
+
+/// first enter guest, pass dtb 
+#[naked]
+pub unsafe extern "C" fn hart_entry_2() -> ! {
+    core::arch::asm!(
+        "fence.i",
+        "li a0, {trap_context}",
+        "csrw sscratch, a0",
+        "mv sp, a0",
+        "ld t0, 32*8(sp)",
+        "ld t1, 33*8(sp)",
+        "csrw sstatus, t0",
+        "csrw sepc, t1",
+        "ld t0, 37*8(sp)",
+        "csrw hstatus, t0",
+        "ld x1, 1*8(sp)",
+        "ld x3, 3*8(sp)",
+        "ld x5, 5*8(sp)",
+        "ld x6, 6*8(sp)",
+        "ld x7, 7*8(sp)",
+        "ld x8, 8*8(sp)",
+        "ld x9, 9*8(sp)",
+        "ld x10, 10*8(sp)",
+        "ld x11, 11*8(sp)",
+        "ld x12, 12*8(sp)",
+        "ld x13, 13*8(sp)",
+        "ld x14, 14*8(sp)",
+        "ld x15, 15*8(sp)",
+        "ld x16, 16*8(sp)",
+        "ld x17, 17*8(sp)",
+        "ld x18, 18*8(sp)",
+        "ld x19, 19*8(sp)",
+        "ld x20, 20*8(sp)",
+        "ld x21, 21*8(sp)",
+        "ld x22, 22*8(sp)",
+        "ld x23, 23*8(sp)",
+        "ld x24, 24*8(sp)",
+        "ld x25, 25*8(sp)",
+        "ld x26, 26*8(sp)",
+        "ld x27, 27*8(sp)",
+        "ld x28, 28*8(sp)",
+        "ld x29, 29*8(sp)",
+        "ld x30, 30*8(sp)",
+        "ld x31, 31*8(sp)",
+        "ld sp, 2*8(sp)",
+        "li a1, {guest_dtb}",
+        "sret",
+        trap_context = const TRAP_CONTEXT,
+        guest_dtb = const GUEST_DTB_ADDR,
+        options(noreturn)
+    )
+}
+
 #[no_mangle]
 /// set the new addr of __restore asm function in TRAMPOLINE page,
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
@@ -211,6 +292,7 @@ pub unsafe fn switch_to_guest() -> ! {
     set_user_trap_entry();
     // get guest context
     let ctx = (TRAP_CONTEXT as *mut TrapContext).as_mut().unwrap();
+    // hdebug!("ctx sp: {:#x}, scause: {:?}", ctx.x[2], scause::read().cause());
 
     // hgatp: set page table for guest physical address translation
     if riscv::register::hgatp::read().bits() != ctx.hgatp {

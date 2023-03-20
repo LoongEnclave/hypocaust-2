@@ -59,7 +59,9 @@ pub struct MachineMeta{
 
     pub clint: Option<Device>,
 
-    pub plic: Option<Device>
+    pub plic: Option<Device>,
+
+    pub pci: Option<Device>,
 }
 
 impl MachineMeta {
@@ -76,18 +78,10 @@ impl MachineMeta {
             if let Some(reg) = node.reg().and_then(|mut reg| reg.next()) {
                 let paddr = reg.starting_address as usize;
                 let size = reg.size.unwrap();
-                let vaddr = paddr;
-                unsafe{
-                    let header = vaddr as *const u32;
-                    let device_id_addr = header.add(2);
-                    let device_id = core::ptr::read_volatile(device_id_addr);
-                    if device_id != 0 {
-                        hdebug!("virtio mmio addr: {:#x}, size: {:#x}", paddr, size);
-                        meta.virtio.push(
-                            Device { base_address: paddr, size }
-                        )
-                    }
-                }
+                hdebug!("virtio mmio addr: {:#x}, size: {:#x}", paddr, size);
+                meta.virtio.push(
+                    Device { base_address: paddr, size }
+                )
             }
         }
         meta.virtio.sort_unstable_by_key(|v| v.base_address);
@@ -132,6 +126,15 @@ impl MachineMeta {
             }
         }
 
+        for node in fdt.find_all_nodes("/soc/pci") {
+            if let Some(reg) = node.reg().and_then(|mut reg| reg.next()) {
+                let base_addr = reg.starting_address as usize;
+                let size = reg.size.unwrap();
+                hdebug!("PCI addr: {:#x}, size: {:#x}", base_addr, size);
+                meta.pci = Some(Device { base_address: base_addr, size});
+            }
+        }
+
         meta
     }
 }
@@ -167,6 +170,10 @@ pub struct HostVmm<P: PageTable, G: GuestPageTable> {
     pub host_plic: Option<PlicState>,
 
     pub irq_pending: bool,
+
+    pub timer_irq: usize,
+    pub external_irq: usize,
+    pub guest_page_falut: usize,
 }
 
 pub fn add_guest_queue(guest: Guest<PageTableSv39>) {
@@ -217,7 +224,9 @@ pub unsafe fn init_vmm(hpm: HostMemorySet<PageTableSv39>, host_machine: MachineM
     sie::set_ssoft();
     sie::set_stimer();
 
-    
+    core::arch::asm!(
+        "csrw vsatp, 0"
+    );
 
     // initialize HOST_VMM
     HOST_VMM.call_once(|| {
@@ -239,7 +248,10 @@ pub unsafe fn init_vmm(hpm: HostMemorySet<PageTableSv39>, host_machine: MachineM
                 guests,
                 guest_id: 0,
                 host_plic,
-                irq_pending: false
+                irq_pending: false,
+                timer_irq: 0,
+                external_irq: 0,
+                guest_page_falut: 0
             }
         )
     });

@@ -12,6 +12,8 @@ GDB			:= gdb-multiarch
 
 FS_IMG 		:= fs.img
 
+ROOTFS		:= /Users/kuangjux/software/kernel_workspace/rootfs.img
+
 ifeq ($(PLATFORM), rCore-Tutorial-v3)
 QEMUOPTS	= --machine virt -m 3G -bios $(BOOTLOADER) -nographic
 QEMUOPTS	+=-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA)
@@ -30,6 +32,25 @@ QEMUOPTS    +=-drive if=none,file=guest/rtthread/sd.bin,format=raw,id=blk0 -devi
 QEMUOPTS 	+=-netdev user,id=tap0 -device virtio-net-device,netdev=tap0,bus=virtio-mmio-bus.1 
 QEMUOPTS 	+=-device virtio-serial-device -chardev socket,host=127.0.0.1,port=4321,server=on,wait=off,telnet=on,id=console0 -device virtserialport,chardev=console0
 # QEMUOPTS    += -machine dumpdtb=rtthread.dtb
+else ifeq ($(PLATFORM), linux)
+QEMUOPTS	= --machine virt -m 3G -bios $(BOOTLOADER) -nographic
+QEMUOPTS	+=-kernel $(KERNEL_BIN)
+QEMUOPTS	+=-drive file=$(ROOTFS),format=raw,id=hd0
+QEMUOPTS 	+=-device virtio-blk-device,drive=hd0
+QEMUOPTS	+=-append "root=/dev/vda rw console=ttyS0"
+else ifeq ($(PLATFORM), u-boot)
+QEMUOPTS	= --machine virt -m 3G -bios $(BOOTLOADER) -nographic
+QEMUOPTS	+=-kernel $(KERNEL_BIN)
+QEMUOPTS	+=-drive file=$(ROOTFS),format=raw,id=hd0
+QEMUOPTS 	+=-device virtio-blk-device,drive=hd0
+QEMUOPTS	+=-append "root=/dev/vda rw console=ttyS0"
+# QEMUOPTS 	+=-machine dumpdtb=linux.dtb
+else ifeq($(PLATFORM), bare-linux)
+QEMUOPTS	= --machine virt -m 3G -bios $(BOOTLOADER) -nographic
+QEMUOPTS	+=-kernel guest.bin
+QEMUOPTS	+=-drive file=$(ROOTFS),format=raw,id=hd0
+QEMUOPTS 	+=-device virtio-blk-device,drive=hd0
+QEMUOPTS	+=-append "root=/dev/vda rw console=ttyS0"
 endif
 
 GUEST_KERNEL_ELF := guest.elf

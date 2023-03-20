@@ -1,6 +1,6 @@
 # hypocaust-2
 ## Overview
-Hypocaust-2 is an experimental type-1 hypervisor with H extension run on RISC-V machine. It depends on the RISC -V H extension, which currently runs on QEMU 7.2.0 or above. It is the successor of the [hypocaust](https://github.com/KuangjuX/hypocaust) project.  
+Hypocaust-2 is an experimental type-1 hypervisor with H extension run on RISC-V machine. It depends on the RISC -V H extension, which currently runs on QEMU 7.1.0 or above. It is the successor of the [hypocaust](https://github.com/KuangjuX/hypocaust) project.  
 
   
 My plan is to build a high-performance riscv64 hypervisor that physically maps the cpu cores, so there is no need to schedule guests in the hypervisor. In addition, the passthrough method for IO devices has achieved good performance.  
@@ -12,7 +12,7 @@ The purpose of this project is to run on bare metal or embedded devices, but it 
 
 
 ## Environment
-- QEMU 7.2.0
+- QEMU 7.1.0
 - RustSBI-QEMU Prereleased 2023-02-01
 - Rust 1.66.0 
 
@@ -62,6 +62,58 @@ $ make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- all -j8
 $ qemu-system-riscv64 -M virt -m 256M -nographic -bios $(BOOTLOADER)/rustsbi-qemu.bin -kernel $(linux)/arch/riscv/boot/Image
 ```
 
+**Docker Command（MacOS/Windows）:**
+```
+# run docker container, mount workspace in docker
+
+docker run -itd --name riscv-env --privileged -v {WORKSPACE}:/workspace riscv-gnu-toolchain /bin/bash
+
+# run docker
+docker exec -it riscv-env /bin/bash
+```
+
+**Make rootfs:**
+```
+git clone https://gitee.com/mirrors/busyboxsource.git
+cd busyboxsource
+
+# Select: Settings -> Build Options -> Build static binary
+CROSS_COMPILE=riscv64-unknown-linux-gnu- make menuconfig
+
+## Build && Install
+CROSS_COMPILE=riscv64-unknown-linux-gnu- make -j10
+CROSS_COMPILE=riscv64-unknown-linux-gnu- make install
+
+# Make minimal root file system
+cd ../
+qemu-img create rootfs.img  1g
+mkfs.ext4 rootfs.img
+
+# mount file system && copy busybox
+mkdir rootfs
+mount -o loop rootfs.img rootfs
+cd rootfs
+cp -r ../busyboxsource/_install/* .
+mkdir proc dev tec etc/init.d
+
+cd etc/init.d/
+touch rcS
+vim rcS
+
+#####
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+/sbin/mdev -s
+#####
+
+chmod +x rcS
+
+umount rootfs
+
+qemu-system-riscv64 -M virt -m 256M -nographic -bios {BOOTLOADR} -kernel {KERNEL_ELF} -drive file=rootfs.img,format=raw,id=hd0  -device virtio-blk-device,drive=hd0 -append "root=/dev/vda rw console=ttyS0"
+
+```
 
 ## RoadMap
 - [x] Load guest elf image.
@@ -131,4 +183,8 @@ WARL fields.)
 - [salus](https://github.com/rivosinc/salus)
 
 ## Relative Links
-- [Summary about booting riscv linux on qemu](http://www.icfgblog.com/index.php/software/324.html)
+- [QEMU 运行 RISC-V linux 总结](http://www.icfgblog.com/index.php/software/324.html)
+- [QEMU 启动方式分析(1): QEMU 及 RISC-V 启动流程简介](https://gitee.com/YJMSTR/riscv-linux/blob/master/articles/20220816-introduction-to-qemu-and-riscv-upstream-boot-flow.md#https://gitee.com/link?target=https%3A%2F%2Ftinylab.org%2Friscv-uefi-part1%2F)
+- [QEMU 启动方式分析(2): QEMU virt 平台下通过 OpenSBI + U-Boot 引导 RISC-V 64 Linux](https://gitee.com/YJMSTR/riscv-linux/blob/master/articles/20220823-boot-riscv-linux-kernel-with-uboot-on-qemu-virt-machine.md)
+
+- [Virtual Memory Layout on RISC-V Linux](https://www.kernel.org/doc/html/latest/riscv/vm-layout.html)

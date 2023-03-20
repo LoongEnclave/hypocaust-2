@@ -89,6 +89,7 @@ pub mod pmap {
         if guest_root != 0 {
             if let Some(translation) = translate_guest_va::<G>(guest_id, guest_root, guest_va) {
                 guest_pa = translation.guest_pa;
+                // htracking!("guest pa: {:#x}", guest_pa);
             }else{
                 return None
             }
@@ -103,21 +104,23 @@ pub mod pmap {
         
     }
 
-    // pub fn decode_inst_at_addr<P: GuestPageTable>(guest_va: usize, gpm: &MemorySet<P>) -> (usize, Option<riscv_decode::Instruction>){
-    //     if let Some(host_va) = two_stage_translation(guest_va, gpm) {
-    //         hdebug!("host va: {:#x}", host_va);
-    //         let i1 = unsafe{ core::ptr::read(host_va as *const u16) };
-    //         let len = riscv_decode::instruction_length(i1);
-    //         let inst = match len {
-    //             2 => i1 as u32, 
-    //             4 => unsafe{ core::ptr::read(host_va as *const u32) },
-    //             _ => unreachable!()
-    //         };
-    //         (len, riscv_decode::decode(inst).ok())
-    //     }else{
-    //         (0, None)
-    //     }
-    // }
+    pub fn fast_two_stage_translation<G: GuestPageTable>(guest_id: usize, guest_va: usize, vsatp: usize) -> Option<usize> {
+        let guest_root = (vsatp & 0x3ff_ffff_ffff) << 12;
+        let guest_pa;
+        if guest_root != 0 {
+            if let Some(translation) = translate_guest_va::<G>(guest_id, guest_root, guest_va) {
+                guest_pa = translation.guest_pa;
+                // htracking!("guest pa: {:#x}", guest_pa);
+            }else{
+                return None
+            }
+        }else{
+            guest_pa = guest_va;
+        }
+        Some(guest_pa)
+        
+    }
+
 
     pub fn decode_inst_at_addr(host_va: usize) -> (usize, Option<Instruction>) {
         let i1 = unsafe{ core::ptr::read(host_va as *const u16) };
@@ -125,6 +128,18 @@ pub mod pmap {
         let inst = match len {
             2 => i1 as u32, 
             4 => unsafe{ core::ptr::read(host_va as *const u32) },
+            _ => unreachable!()
+        };
+        (len, riscv_decode::decode(inst).ok())
+    }
+
+    /// decode risc-v instruction, return (inst len, inst)
+    pub fn decode_inst(inst: usize) -> (usize, Option<Instruction>) {
+        let i1 = inst as u16;
+        let len = riscv_decode::instruction_length(i1);
+        let inst = match len {
+            2 => i1 as u32,
+            4 => inst as u32,
             _ => unreachable!()
         };
         (len, riscv_decode::decode(inst).ok())
